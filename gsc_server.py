@@ -1888,22 +1888,37 @@ def main():
                 # echo them back so subsequent /authorize knows them.
                 if method == "POST" and req_path == "/register":
                     body = await _drain_body(receive)
+                    if debug_requests:
+                        print(
+                            f"[mcp-debug] /register body: {body!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     try:
                         req = json.loads(body.decode("utf-8")) if body else {}
                     except (ValueError, UnicodeDecodeError):
                         req = {}
                     redirect_uris = req.get("redirect_uris") or []
+                    # Echo back key fields the client sent plus the
+                    # auth method we support. Include the full set of
+                    # RFC 7591 response fields some clients parse.
                     await _json(
                         send,
                         201,
                         {
                             "client_id": _DUMMY_CLIENT_ID,
                             "client_id_issued_at": int(_time.time()),
+                            "client_secret_expires_at": 0,
                             "redirect_uris": redirect_uris,
-                            "token_endpoint_auth_method": "none",
-                            "grant_types": ["authorization_code"],
-                            "response_types": ["code"],
-                            "application_type": "web",
+                            "token_endpoint_auth_method": req.get(
+                                "token_endpoint_auth_method", "none"
+                            ),
+                            "grant_types": req.get(
+                                "grant_types", ["authorization_code"]
+                            ),
+                            "response_types": req.get("response_types", ["code"]),
+                            "client_name": req.get("client_name", "MCP Client"),
+                            "scope": req.get("scope", "mcp"),
                         },
                     )
                     return
@@ -1932,17 +1947,34 @@ def main():
 
                 # --- 5. Token endpoint — issue dummy bearer ---
                 if method == "POST" and req_path == "/token":
-                    await _drain_body(receive)
-                    await _json(
-                        send,
-                        200,
-                        {
-                            "access_token": _DUMMY_TOKEN,
-                            "token_type": "Bearer",
-                            "expires_in": 3600,
-                            "scope": "mcp",
-                        },
-                    )
+                    body = await _drain_body(receive)
+                    # Claude sends form-encoded body per RFC 6749. Echo
+                    # back the ``resource`` param (RFC 8707) because some
+                    # clients validate that the token is audience-bound.
+                    resource = ""
+                    scope_req = "mcp"
+                    try:
+                        form = parse_qs(body.decode("utf-8"))
+                        resource = (form.get("resource") or [""])[0]
+                        scope_req = (form.get("scope") or ["mcp"])[0]
+                    except UnicodeDecodeError:
+                        pass
+                    if debug_requests:
+                        print(
+                            f"[mcp-debug] /token body: {body!r}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    resp = {
+                        "access_token": _DUMMY_TOKEN,
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "scope": scope_req,
+                        "refresh_token": _DUMMY_TOKEN + "-refresh",
+                    }
+                    if resource:
+                        resp["resource"] = resource
+                    await _json(send, 200, resp)
                     return
 
                 await asgi_app(scope, receive, send)
