@@ -1752,15 +1752,89 @@ def main():
         from starlette.responses import PlainTextResponse
 
         def oauth_stub_middleware(asgi_app):
-            """Claude.ai's MCP connector probes OAuth discovery endpoints
-            (RFC 9728 / RFC 8414) even for servers without auth. If these
-            404, Claude falls back through a retry path that ultimately
-            posts to a stale /mcp URL and fails. Returning minimal
-            Protected Resource metadata with empty authorization_servers
-            signals 'this resource does not require OAuth' and lets the
-            connector proceed with the initialize response it already got.
+            """Minimal OAuth 2.1 stub for Claude.ai's MCP connector.
+
+            Claude.ai hard-requires OAuth discovery (RFC 9728 + RFC 8414)
+            and Dynamic Client Registration (RFC 7591) for remote MCP
+            connectors; returning 404 on these endpoints makes the
+            connector fail with 'Couldn't reach the MCP server'.
+            Empty ``authorization_servers`` does NOT convince it to skip
+            auth — verified empirically.
+
+            This stub issues dummy credentials and tokens. Real security
+            still rests on:
+              - HTTPS (Cloudflare / Let's Encrypt terminates TLS)
+              - Secret URL path prefix (MCP_PATH)
+              - Upstream service-account scopes
+            The bearer token we issue is never validated against anything
+            because the MCP endpoint (when MCP_BEARER_TOKEN is unset)
+            ignores the ``Authorization`` header entirely. Do not enable
+            MCP_BEARER_TOKEN together with this stub — the real MCP
+            bearer check would reject the dummy tokens we issue here.
             """
+            import time as _time
+            from urllib.parse import parse_qs, quote, urlencode
+
             _WELL_KNOWN_PRM = "/.well-known/oauth-protected-resource"
+            _WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
+            _DUMMY_CLIENT_ID = "mcp-gsc-public-client"
+            _DUMMY_CODE = "mcp-gsc-dummy-code"
+            _DUMMY_TOKEN = "mcp-gsc-dummy-token"
+
+            def _external_base(scope):
+                host = ""
+                proto = None
+                for name, value in scope.get("headers", []):
+                    if name == b"host" and not host:
+                        host = value.decode("latin-1")
+                    elif name == b"x-forwarded-host" and not host:
+                        host = value.decode("latin-1").split(",")[0].strip()
+                    elif name == b"x-forwarded-proto":
+                        proto = value.decode("latin-1").split(",")[0].strip()
+                if not proto:
+                    proto = scope.get("scheme", "http")
+                return f"{proto}://{host}" if host else ""
+
+            async def _json(send, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": status,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                            (b"cache-control", b"no-store"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+
+            async def _redirect(send, location):
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 302,
+                        "headers": [
+                            (b"location", location.encode("utf-8")),
+                            (b"cache-control", b"no-store"),
+                            (b"content-length", b"0"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": b""})
+
+            async def _drain_body(receive):
+                chunks = []
+                more = True
+                while more:
+                    msg = await receive()
+                    if msg["type"] == "http.request":
+                        chunks.append(msg.get("body", b""))
+                        more = msg.get("more_body", False)
+                    else:
+                        more = False
+                return b"".join(chunks)
 
             async def wrapped(scope, receive, send):
                 if scope["type"] != "http":
@@ -1770,37 +1844,105 @@ def main():
                 req_path = scope.get("path", "")
                 method = scope.get("method", "")
 
+                # --- 1. Protected Resource Metadata (RFC 9728) ---
+                # Claude probes both /.well-known/oauth-protected-resource
+                # and /.well-known/oauth-protected-resource/<resource-path>.
                 if method == "GET" and req_path.startswith(_WELL_KNOWN_PRM):
-                    host = ""
-                    for name, value in scope.get("headers", []):
-                        if name == b"host":
-                            host = value.decode("latin-1")
-                            break
-                    scheme = scope.get("scheme", "https")
-                    # Claude probes both the root /.well-known/... and a
-                    # path-suffixed variant /.well-known/.../<resource-path>.
-                    # Echo the suffix back as the resource URL so the metadata
-                    # is self-consistent regardless of which variant was hit.
+                    base = _external_base(scope)
                     suffix = req_path[len(_WELL_KNOWN_PRM):]
-                    resource = f"{scheme}://{host}{suffix}" if host else suffix
-                    body = json.dumps(
+                    resource = f"{base}{suffix}" if base else suffix
+                    await _json(
+                        send,
+                        200,
                         {
                             "resource": resource,
-                            "authorization_servers": [],
-                        }
-                    ).encode("utf-8")
-                    await send(
-                        {
-                            "type": "http.response.start",
-                            "status": 200,
-                            "headers": [
-                                (b"content-type", b"application/json"),
-                                (b"content-length", str(len(body)).encode()),
-                                (b"cache-control", b"public, max-age=3600"),
-                            ],
-                        }
+                            "authorization_servers": [base] if base else [],
+                            "bearer_methods_supported": ["header"],
+                        },
                     )
-                    await send({"type": "http.response.body", "body": body})
+                    return
+
+                # --- 2. Authorization Server Metadata (RFC 8414) ---
+                if method == "GET" and req_path == _WELL_KNOWN_AS:
+                    base = _external_base(scope)
+                    await _json(
+                        send,
+                        200,
+                        {
+                            "issuer": base,
+                            "authorization_endpoint": f"{base}/authorize",
+                            "token_endpoint": f"{base}/token",
+                            "registration_endpoint": f"{base}/register",
+                            "response_types_supported": ["code"],
+                            "grant_types_supported": ["authorization_code"],
+                            "code_challenge_methods_supported": ["S256", "plain"],
+                            "token_endpoint_auth_methods_supported": ["none"],
+                            "scopes_supported": ["mcp"],
+                        },
+                    )
+                    return
+
+                # --- 3. Dynamic Client Registration (RFC 7591) ---
+                # Accept any registration request, echo back a fixed
+                # client_id. Claude sends JSON with redirect_uris; we
+                # echo them back so subsequent /authorize knows them.
+                if method == "POST" and req_path == "/register":
+                    body = await _drain_body(receive)
+                    try:
+                        req = json.loads(body.decode("utf-8")) if body else {}
+                    except (ValueError, UnicodeDecodeError):
+                        req = {}
+                    redirect_uris = req.get("redirect_uris") or []
+                    await _json(
+                        send,
+                        201,
+                        {
+                            "client_id": _DUMMY_CLIENT_ID,
+                            "client_id_issued_at": int(_time.time()),
+                            "redirect_uris": redirect_uris,
+                            "token_endpoint_auth_method": "none",
+                            "grant_types": ["authorization_code"],
+                            "response_types": ["code"],
+                            "application_type": "web",
+                        },
+                    )
+                    return
+
+                # --- 4. Authorization endpoint — auto-approve ---
+                # Claude's browser lands here, we immediately 302 back
+                # to its redirect_uri with a dummy code. No user UI.
+                if method == "GET" and req_path == "/authorize":
+                    query = scope.get("query_string", b"").decode("latin-1")
+                    params = parse_qs(query)
+                    redirect_uri = (params.get("redirect_uri") or [""])[0]
+                    state = (params.get("state") or [""])[0]
+                    if not redirect_uri:
+                        await _json(
+                            send,
+                            400,
+                            {"error": "invalid_request", "error_description": "missing redirect_uri"},
+                        )
+                        return
+                    cb_params = {"code": _DUMMY_CODE}
+                    if state:
+                        cb_params["state"] = state
+                    sep = "&" if "?" in redirect_uri else "?"
+                    await _redirect(send, f"{redirect_uri}{sep}{urlencode(cb_params)}")
+                    return
+
+                # --- 5. Token endpoint — issue dummy bearer ---
+                if method == "POST" and req_path == "/token":
+                    await _drain_body(receive)
+                    await _json(
+                        send,
+                        200,
+                        {
+                            "access_token": _DUMMY_TOKEN,
+                            "token_type": "Bearer",
+                            "expires_in": 3600,
+                            "scope": "mcp",
+                        },
+                    )
                     return
 
                 await asgi_app(scope, receive, send)
