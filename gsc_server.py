@@ -1740,96 +1740,143 @@ def main():
             "yes",
         )
 
-        if not bearer_token and not debug_requests:
-            # Nothing to wrap — let FastMCP.run() do its thing directly.
-            mcp.run(transport="streamable-http")
-        else:
-            import anyio
-            import hmac as _hmac
-            import uvicorn
-            from starlette.responses import PlainTextResponse
+        # Always go through the custom uvicorn path so we can stack middlewares:
+        #   accept_shim (always) → debug (optional) → bearer (optional) → MCP
+        # The Accept shim is required because the MCP SDK's Accept validator
+        # does a strict prefix match. Clients that send Accept: */* (observed:
+        # Claude.ai MCP connector) get 406 even though */* means "anything".
+        # We rewrite such requests to spec-compliant Accept before dispatching.
+        import anyio
+        import hmac as _hmac
+        import uvicorn
+        from starlette.responses import PlainTextResponse
 
-            def debug_log_middleware(asgi_app):
-                async def wrapped(scope, receive, send):
-                    if scope["type"] == "http":
-                        headers = {
-                            name.decode("latin-1"): value.decode("latin-1")
-                            for name, value in scope.get("headers", [])
-                        }
-                        method = scope.get("method", "?")
-                        req_path = scope.get("path", "?")
-                        accept = headers.get("accept", "<absent>")
-                        ctype = headers.get("content-type", "<absent>")
-                        has_auth = "authorization" in headers
-                        print(
-                            f"[mcp-debug] {method} {req_path} "
-                            f"Accept={accept!r} Content-Type={ctype!r} "
-                            f"has-auth={has_auth}",
-                            file=sys.stderr,
-                            flush=True,
-                        )
+        def accept_shim_middleware(asgi_app):
+            """Rewrite Accept: */* (or missing Accept) to spec-compliant
+            'application/json, text/event-stream' so the MCP SDK's strict
+            prefix-matcher doesn't 406 spec-agnostic clients."""
+            spec_accept = b"application/json, text/event-stream"
+
+            async def wrapped(scope, receive, send):
+                if scope["type"] != "http":
+                    await asgi_app(scope, receive, send)
+                    return
+
+                new_headers = []
+                found_accept = False
+                needs_rewrite = False
+                for name, value in scope.get("headers", []):
+                    if name == b"accept":
+                        found_accept = True
+                        val_lower = value.decode("latin-1").lower()
+                        # Already contains a specific MCP content type — pass through.
+                        if (
+                            "application/json" in val_lower
+                            or "text/event-stream" in val_lower
+                        ):
+                            new_headers.append((name, value))
+                        else:
+                            # */*, missing specific types, or non-MCP types — rewrite.
+                            new_headers.append((name, spec_accept))
+                            needs_rewrite = True
+                    else:
+                        new_headers.append((name, value))
+
+                if not found_accept:
+                    new_headers.append((b"accept", spec_accept))
+                    needs_rewrite = True
+
+                if needs_rewrite:
+                    new_scope = dict(scope)
+                    new_scope["headers"] = new_headers
+                    await asgi_app(new_scope, receive, send)
+                else:
                     await asgi_app(scope, receive, send)
 
-                return wrapped
+            return wrapped
 
-            def bearer_auth_middleware(asgi_app, expected_auth_bytes):
-                async def wrapped(scope, receive, send):
-                    if scope["type"] != "http":
-                        await asgi_app(scope, receive, send)
-                        return
+        def debug_log_middleware(asgi_app):
+            async def wrapped(scope, receive, send):
+                if scope["type"] == "http":
+                    headers = {
+                        name.decode("latin-1"): value.decode("latin-1")
+                        for name, value in scope.get("headers", [])
+                    }
+                    method = scope.get("method", "?")
+                    req_path = scope.get("path", "?")
+                    accept = headers.get("accept", "<absent>")
+                    ctype = headers.get("content-type", "<absent>")
+                    has_auth = "authorization" in headers
+                    print(
+                        f"[mcp-debug] {method} {req_path} "
+                        f"Accept={accept!r} Content-Type={ctype!r} "
+                        f"has-auth={has_auth}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                await asgi_app(scope, receive, send)
 
-                    auth_header = b""
-                    for name, value in scope.get("headers", []):
-                        if name == b"authorization":
-                            auth_header = value
-                            break
+            return wrapped
 
-                    if not _hmac.compare_digest(auth_header, expected_auth_bytes):
-                        response = PlainTextResponse(
-                            "Unauthorized",
-                            status_code=401,
-                            headers={"WWW-Authenticate": 'Bearer realm="mcp-gsc"'},
-                        )
-                        await response(scope, receive, send)
-                        return
-
+        def bearer_auth_middleware(asgi_app, expected_auth_bytes):
+            async def wrapped(scope, receive, send):
+                if scope["type"] != "http":
                     await asgi_app(scope, receive, send)
+                    return
 
-                return wrapped
+                auth_header = b""
+                for name, value in scope.get("headers", []):
+                    if name == b"authorization":
+                        auth_header = value
+                        break
 
-            async def _serve():
-                app = mcp.streamable_http_app()
-                # Stack inside-out: innermost = MCP, then optional bearer,
-                # then optional debug (outermost so it sees original request
-                # before any rejection).
-                if bearer_token:
-                    expected = f"Bearer {bearer_token}".encode("utf-8")
-                    app = bearer_auth_middleware(app, expected)
-                if debug_requests:
-                    app = debug_log_middleware(app)
+                if not _hmac.compare_digest(auth_header, expected_auth_bytes):
+                    response = PlainTextResponse(
+                        "Unauthorized",
+                        status_code=401,
+                        headers={"WWW-Authenticate": 'Bearer realm="mcp-gsc"'},
+                    )
+                    await response(scope, receive, send)
+                    return
 
-                config = uvicorn.Config(
-                    app,
-                    host=host,
-                    port=port,
-                    log_level=mcp.settings.log_level.lower(),
-                )
-                server = uvicorn.Server(config)
-                await server.serve()
+                await asgi_app(scope, receive, send)
 
+            return wrapped
+
+        async def _serve():
+            app = mcp.streamable_http_app()
+            # Stack inside-out: MCP (innermost) → bearer → accept_shim → debug
             if bearer_token:
-                print(
-                    f"[gsc-server] Bearer token auth ENABLED "
-                    f"(token length: {len(bearer_token)})",
-                    file=sys.stderr,
-                )
+                expected = f"Bearer {bearer_token}".encode("utf-8")
+                app = bearer_auth_middleware(app, expected)
+            # Accept shim must run AFTER bearer auth (so bearer can still
+            # reject unauth) but BEFORE the SDK's strict Accept check.
+            app = accept_shim_middleware(app)
             if debug_requests:
-                print(
-                    "[gsc-server] Debug request logging ENABLED "
-                    "(set MCP_DEBUG_REQUESTS=false to disable)",
-                    file=sys.stderr,
-                )
-            anyio.run(_serve)
+                app = debug_log_middleware(app)
+
+            config = uvicorn.Config(
+                app,
+                host=host,
+                port=port,
+                log_level=mcp.settings.log_level.lower(),
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
+
+        if bearer_token:
+            print(
+                f"[gsc-server] Bearer token auth ENABLED "
+                f"(token length: {len(bearer_token)})",
+                file=sys.stderr,
+            )
+        if debug_requests:
+            print(
+                "[gsc-server] Debug request logging ENABLED "
+                "(set MCP_DEBUG_REQUESTS=false to disable)",
+                file=sys.stderr,
+            )
+        anyio.run(_serve)
     else:
         raise ValueError(
             f"Unknown MCP_TRANSPORT '{transport}'. "
