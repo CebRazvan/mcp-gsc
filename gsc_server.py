@@ -1684,13 +1684,101 @@ def main():
         # Configure FastMCP's settings in place; the module-level FastMCP()
         # constructor already ran, so we mutate the settings object rather
         # than passing kwargs to run().
+        from mcp.server.transport_security import TransportSecuritySettings
+
         path = os.environ.get("MCP_PATH", "/mcp")
         mcp.settings.host = host
         mcp.settings.port = port
         mcp.settings.stateless_http = True
         mcp.settings.json_response = True
         mcp.settings.streamable_http_path = path
-        mcp.run(transport="streamable-http")
+
+        # DNS rebinding protection: the module-level FastMCP() default sets
+        # host=127.0.0.1, which auto-enables protection whitelisting only
+        # localhost. For a public endpoint behind a reverse proxy we need to
+        # either whitelist our actual host(s) or disable protection.
+        allowed_hosts = [
+            h.strip()
+            for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",")
+            if h.strip()
+        ]
+        allowed_origins = [
+            o.strip()
+            for o in os.environ.get("MCP_ALLOWED_ORIGINS", "").split(",")
+            if o.strip()
+        ]
+        if allowed_hosts or allowed_origins:
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=True,
+                allowed_hosts=allowed_hosts,
+                allowed_origins=allowed_origins,
+            )
+        else:
+            # No whitelist provided — trust the reverse proxy / network layer.
+            mcp.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            )
+
+        # Optional Bearer-token auth. If MCP_BEARER_TOKEN is set, we wrap the
+        # Starlette app with a minimal ASGI middleware that rejects anything
+        # without a matching Authorization header (HTTP 401). If unset, the
+        # server is unauthenticated — fine for local/dev but dangerous for a
+        # public endpoint. Comparison is timing-safe via hmac.compare_digest.
+        bearer_token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+
+        if not bearer_token:
+            mcp.run(transport="streamable-http")
+        else:
+            import anyio
+            import hmac as _hmac
+            import uvicorn
+            from starlette.responses import PlainTextResponse
+
+            expected_auth = f"Bearer {bearer_token}".encode("utf-8")
+
+            def bearer_auth_middleware(asgi_app):
+                async def wrapped(scope, receive, send):
+                    if scope["type"] != "http":
+                        await asgi_app(scope, receive, send)
+                        return
+
+                    auth_header = b""
+                    for name, value in scope.get("headers", []):
+                        if name == b"authorization":
+                            auth_header = value
+                            break
+
+                    if not _hmac.compare_digest(auth_header, expected_auth):
+                        response = PlainTextResponse(
+                            "Unauthorized",
+                            status_code=401,
+                            headers={"WWW-Authenticate": 'Bearer realm="mcp-gsc"'},
+                        )
+                        await response(scope, receive, send)
+                        return
+
+                    await asgi_app(scope, receive, send)
+
+                return wrapped
+
+            async def _serve():
+                starlette_app = mcp.streamable_http_app()
+                wrapped_app = bearer_auth_middleware(starlette_app)
+                config = uvicorn.Config(
+                    wrapped_app,
+                    host=host,
+                    port=port,
+                    log_level=mcp.settings.log_level.lower(),
+                )
+                server = uvicorn.Server(config)
+                await server.serve()
+
+            print(
+                f"[gsc-server] Bearer token auth ENABLED "
+                f"(token length: {len(bearer_token)})",
+                file=sys.stderr,
+            )
+            anyio.run(_serve)
     else:
         raise ValueError(
             f"Unknown MCP_TRANSPORT '{transport}'. "

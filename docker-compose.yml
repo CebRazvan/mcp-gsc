@@ -13,6 +13,10 @@ services:
       GSC_CREDENTIALS_PATH: /run/secrets/gsc_sa.json
       GSC_DATA_STATE: all
       GSC_ALLOW_DESTRUCTIVE: "false"
+      # Bearer-token auth: leave blank for no auth (local/dev). In Dokploy
+      # set MCP_BEARER_TOKEN to a long random secret (openssl rand -hex 32).
+      # Interpolated from host env at compose start — never committed to git.
+      MCP_BEARER_TOKEN: "${MCP_BEARER_TOKEN:-}"
     volumes:
       # SA JSON must be chown'd to 10001:10001 on the host before the first
       # start, otherwise the non-root container hits EACCES. See DEPLOY.md.

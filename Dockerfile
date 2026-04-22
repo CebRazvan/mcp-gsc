@@ -50,10 +50,11 @@ EXPOSE 3001
 USER 10001:10001
 
 # Tolerant healthcheck: MCP streamable-http returns 400/405/406 for naive GET
-# without the right Accept headers. Any of those codes means "process is alive
-# and answering", which is what we want. 5xx / timeout = really broken.
+# without the right Accept headers. 401 appears when MCP_BEARER_TOKEN is set
+# and the healthcheck itself has no token — still means "process is alive".
+# Any of those codes = healthy. 5xx / timeout = really broken.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS -o /dev/null -w "%{http_code}" http://localhost:3001/mcp \
-        | grep -qE "^(200|400|405|406)$" || exit 1
+        | grep -qE "^(200|400|401|405|406)$" || exit 1
 
 CMD ["python", "gsc_server.py"]
