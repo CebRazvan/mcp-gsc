@@ -17,6 +17,18 @@ services:
       # set MCP_BEARER_TOKEN to a long random secret (openssl rand -hex 32).
       # Interpolated from host env at compose start — never committed to git.
       MCP_BEARER_TOKEN: "${MCP_BEARER_TOKEN:-}"
+      # Response mode: "false" = SSE streaming (default, most compatible),
+      # "true" = JSON-only response (only some clients). Start with SSE.
+      MCP_JSON_RESPONSE: "${MCP_JSON_RESPONSE:-false}"
+      # Debug request logger: when "true", prints every HTTP request's
+      # method, path, Accept, Content-Type, and auth presence to stderr.
+      # Useful for diagnosing 406 / 404 / auth issues with unknown clients.
+      # Disable after debugging — otherwise logs get noisy.
+      MCP_DEBUG_REQUESTS: "${MCP_DEBUG_REQUESTS:-false}"
+      # DNS rebinding protection (optional hardening). If set, enables strict
+      # Host / Origin whitelist. See .env.example for details.
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-}"
+      MCP_ALLOWED_ORIGINS: "${MCP_ALLOWED_ORIGINS:-}"
     volumes:
       # SA JSON must be chown'd to 10001:10001 on the host before the first
       # start, otherwise the non-root container hits EACCES. See DEPLOY.md.
