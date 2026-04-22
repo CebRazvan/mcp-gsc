@@ -1782,9 +1782,9 @@ def main():
 
             _WELL_KNOWN_PRM = "/.well-known/oauth-protected-resource"
             _WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
+            _WELL_KNOWN_OIDC = "/.well-known/openid-configuration"
             _JWKS_PATH = "/.well-known/jwks.json"
             _DUMMY_CLIENT_ID = "mcp-gsc-public-client"
-            _DUMMY_CODE = "mcp-gsc-dummy-code"
             _KID = "mcp-gsc-stub-rsa-1"
 
             # Generate an RSA keypair at process start. Public key is
@@ -1908,8 +1908,10 @@ def main():
                     )
                     return
 
-                # --- 2. Authorization Server Metadata (RFC 8414) ---
-                if method == "GET" and req_path == _WELL_KNOWN_AS:
+                # --- 2. Authorization Server Metadata (RFC 8414)  ---
+                # Also served at /.well-known/openid-configuration as
+                # some clients probe the OIDC alias instead.
+                if method == "GET" and req_path in (_WELL_KNOWN_AS, _WELL_KNOWN_OIDC):
                     base = _external_base(scope)
                     await _json(
                         send,
@@ -1919,6 +1921,8 @@ def main():
                             "authorization_endpoint": f"{base}/authorize",
                             "token_endpoint": f"{base}/token",
                             "registration_endpoint": f"{base}/register",
+                            "revocation_endpoint": f"{base}/revoke",
+                            "introspection_endpoint": f"{base}/introspect",
                             "jwks_uri": f"{base}{_JWKS_PATH}",
                             "response_types_supported": ["code"],
                             "grant_types_supported": [
@@ -1929,6 +1933,8 @@ def main():
                             "token_endpoint_auth_methods_supported": ["none"],
                             "scopes_supported": ["mcp"],
                             "id_token_signing_alg_values_supported": ["RS256"],
+                            "subject_types_supported": ["public"],
+                            "response_modes_supported": ["query"],
                         },
                     )
                     return
@@ -1936,6 +1942,34 @@ def main():
                 # --- 2b. JWKS — public key for JWT signature verification ---
                 if method == "GET" and req_path == _JWKS_PATH:
                     await _json(send, 200, {"keys": [_JWK_PUBLIC]})
+                    return
+
+                # --- 2c. Token revocation (RFC 7009) — no-op ---
+                if method == "POST" and req_path == "/revoke":
+                    await _drain_body(receive)
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 200,
+                            "headers": [(b"content-length", b"0")],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": b""})
+                    return
+
+                # --- 2d. Token introspection (RFC 7662) — always active ---
+                if method == "POST" and req_path == "/introspect":
+                    await _drain_body(receive)
+                    await _json(
+                        send,
+                        200,
+                        {
+                            "active": True,
+                            "scope": "mcp",
+                            "client_id": _DUMMY_CLIENT_ID,
+                            "token_type": "Bearer",
+                        },
+                    )
                     return
 
                 # --- 3. Dynamic Client Registration (RFC 7591) ---
@@ -1980,8 +2014,11 @@ def main():
                     return
 
                 # --- 4. Authorization endpoint — auto-approve ---
-                # Claude's browser lands here, we immediately 302 back
-                # to its redirect_uri with a dummy code. No user UI.
+                # Browser lands here, we immediately 302 back to the
+                # registered redirect_uri with a freshly generated
+                # authorization code. A static code triggers Claude's
+                # replay-detection logic (MCP spec 2025-11-25 mandates
+                # that codes be cryptographically random).
                 if method == "GET" and req_path == "/authorize":
                     query = scope.get("query_string", b"").decode("latin-1")
                     params = parse_qs(query)
@@ -1994,7 +2031,10 @@ def main():
                             {"error": "invalid_request", "error_description": "missing redirect_uri"},
                         )
                         return
-                    cb_params = {"code": _DUMMY_CODE}
+                    # Fresh per-flow code; we don't persist it (stateless
+                    # stub) and accept any code at /token.
+                    code = _secrets.token_urlsafe(32)
+                    cb_params = {"code": code}
                     if state:
                         cb_params["state"] = state
                     sep = "&" if "?" in redirect_uri else "?"
