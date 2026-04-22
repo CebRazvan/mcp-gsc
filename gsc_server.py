@@ -1751,6 +1751,62 @@ def main():
         import uvicorn
         from starlette.responses import PlainTextResponse
 
+        def oauth_stub_middleware(asgi_app):
+            """Claude.ai's MCP connector probes OAuth discovery endpoints
+            (RFC 9728 / RFC 8414) even for servers without auth. If these
+            404, Claude falls back through a retry path that ultimately
+            posts to a stale /mcp URL and fails. Returning minimal
+            Protected Resource metadata with empty authorization_servers
+            signals 'this resource does not require OAuth' and lets the
+            connector proceed with the initialize response it already got.
+            """
+            _WELL_KNOWN_PRM = "/.well-known/oauth-protected-resource"
+
+            async def wrapped(scope, receive, send):
+                if scope["type"] != "http":
+                    await asgi_app(scope, receive, send)
+                    return
+
+                req_path = scope.get("path", "")
+                method = scope.get("method", "")
+
+                if method == "GET" and req_path.startswith(_WELL_KNOWN_PRM):
+                    host = ""
+                    for name, value in scope.get("headers", []):
+                        if name == b"host":
+                            host = value.decode("latin-1")
+                            break
+                    scheme = scope.get("scheme", "https")
+                    # Claude probes both the root /.well-known/... and a
+                    # path-suffixed variant /.well-known/.../<resource-path>.
+                    # Echo the suffix back as the resource URL so the metadata
+                    # is self-consistent regardless of which variant was hit.
+                    suffix = req_path[len(_WELL_KNOWN_PRM):]
+                    resource = f"{scheme}://{host}{suffix}" if host else suffix
+                    body = json.dumps(
+                        {
+                            "resource": resource,
+                            "authorization_servers": [],
+                        }
+                    ).encode("utf-8")
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": 200,
+                            "headers": [
+                                (b"content-type", b"application/json"),
+                                (b"content-length", str(len(body)).encode()),
+                                (b"cache-control", b"public, max-age=3600"),
+                            ],
+                        }
+                    )
+                    await send({"type": "http.response.body", "body": body})
+                    return
+
+                await asgi_app(scope, receive, send)
+
+            return wrapped
+
         def accept_shim_middleware(asgi_app):
             """Rewrite Accept: */* (or missing Accept) to spec-compliant
             'application/json, text/event-stream' so the MCP SDK's strict
@@ -1845,13 +1901,19 @@ def main():
 
         async def _serve():
             app = mcp.streamable_http_app()
-            # Stack inside-out: MCP (innermost) → bearer → accept_shim → debug
+            # Stack inside-out: MCP (innermost) → bearer → accept_shim
+            #                 → oauth_stub → debug
             if bearer_token:
                 expected = f"Bearer {bearer_token}".encode("utf-8")
                 app = bearer_auth_middleware(app, expected)
             # Accept shim must run AFTER bearer auth (so bearer can still
             # reject unauth) but BEFORE the SDK's strict Accept check.
             app = accept_shim_middleware(app)
+            # OAuth stub must run OUTSIDE bearer (discovery should always
+            # be reachable) and OUTSIDE accept_shim (we serve our own JSON
+            # response). Short-circuits /.well-known/oauth-protected-resource
+            # so Claude.ai connector sees 'no auth required' and proceeds.
+            app = oauth_stub_middleware(app)
             if debug_requests:
                 app = debug_log_middleware(app)
 
