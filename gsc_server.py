@@ -1772,6 +1772,10 @@ def main():
             MCP_BEARER_TOKEN together with this stub — the real MCP
             bearer check would reject the dummy tokens we issue here.
             """
+            import base64 as _b64
+            import hashlib as _hashlib
+            import hmac as _hmac_jwt
+            import secrets as _secrets
             import time as _time
             from urllib.parse import parse_qs, quote, urlencode
 
@@ -1779,7 +1783,27 @@ def main():
             _WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
             _DUMMY_CLIENT_ID = "mcp-gsc-public-client"
             _DUMMY_CODE = "mcp-gsc-dummy-code"
-            _DUMMY_TOKEN = "mcp-gsc-dummy-token"
+            # Per-process HMAC secret for signing stub JWTs. It is not
+            # used to authenticate anything — the MCP endpoint ignores
+            # bearer tokens when MCP_BEARER_TOKEN is unset. Exists only
+            # so Claude.ai's token parser accepts a structurally valid
+            # HS256 JWT (Claude parses the access_token as JWT to extract
+            # exp/aud/scope before using it).
+            _JWT_SECRET = _secrets.token_bytes(32)
+
+            def _b64url(raw: bytes) -> bytes:
+                return _b64.urlsafe_b64encode(raw).rstrip(b"=")
+
+            def _make_jwt(payload: dict, typ: str = "at+jwt") -> str:
+                header = {"alg": "HS256", "typ": typ}
+                h = _b64url(json.dumps(header, separators=(",", ":")).encode())
+                p = _b64url(json.dumps(payload, separators=(",", ":")).encode())
+                signing_input = h + b"." + p
+                sig = _hmac_jwt.new(
+                    _JWT_SECRET, signing_input, _hashlib.sha256
+                ).digest()
+                s = _b64url(sig)
+                return (signing_input + b"." + s).decode("ascii")
 
             def _external_base(scope):
                 host = ""
@@ -1945,12 +1969,10 @@ def main():
                     await _redirect(send, f"{redirect_uri}{sep}{urlencode(cb_params)}")
                     return
 
-                # --- 5. Token endpoint — issue dummy bearer ---
+                # --- 5. Token endpoint — issue stub JWT bearer ---
                 if method == "POST" and req_path == "/token":
                     body = await _drain_body(receive)
-                    # Claude sends form-encoded body per RFC 6749. Echo
-                    # back the ``resource`` param (RFC 8707) because some
-                    # clients validate that the token is audience-bound.
+                    # Claude sends form-encoded body per RFC 6749.
                     resource = ""
                     scope_req = "mcp"
                     try:
@@ -1965,12 +1987,34 @@ def main():
                             file=sys.stderr,
                             flush=True,
                         )
+                    # RFC 9068 "at+jwt" profile + RFC 8707 audience-binding.
+                    # Claude.ai parses access_token as a JWT to extract
+                    # exp/aud/scope — an opaque string fails that parse.
+                    base = _external_base(scope)
+                    aud = resource or base
+                    now = int(_time.time())
+                    access_claims = {
+                        "iss": base or "mcp-gsc-stub",
+                        "sub": "mcp-gsc-anonymous",
+                        "aud": aud,
+                        "exp": now + 3600,
+                        "iat": now,
+                        "nbf": now,
+                        "scope": scope_req,
+                        "client_id": _DUMMY_CLIENT_ID,
+                        "jti": _secrets.token_urlsafe(16),
+                    }
+                    access_token = _make_jwt(access_claims, typ="at+jwt")
+                    refresh_claims = dict(access_claims)
+                    refresh_claims["exp"] = now + 30 * 24 * 3600
+                    refresh_claims["jti"] = _secrets.token_urlsafe(16)
+                    refresh_token = _make_jwt(refresh_claims, typ="rt+jwt")
                     resp = {
-                        "access_token": _DUMMY_TOKEN,
+                        "access_token": access_token,
                         "token_type": "Bearer",
                         "expires_in": 3600,
                         "scope": scope_req,
-                        "refresh_token": _DUMMY_TOKEN + "-refresh",
+                        "refresh_token": refresh_token,
                     }
                     if resource:
                         resp["resource"] = resource
