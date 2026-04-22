@@ -2149,20 +2149,114 @@ def main():
 
             return wrapped
 
+        def mcp_auth_gate_middleware(asgi_app, mcp_path):
+            """Enforce MCP auth spec (2025-11-25): unauthenticated
+            requests on the MCP endpoint MUST get 401 with a
+            WWW-Authenticate header pointing to the Protected
+            Resource Metadata URL. Without this, Claude.ai completes
+            the OAuth flow but fails to use the resulting token
+            because the first unauth request already returned 200.
+
+            Any Bearer token is accepted — validation of the token
+            contents happens nowhere (this server issues its own
+            stub tokens via the oauth_stub middleware). Real
+            security lives at the transport layer (HTTPS) and at
+            the URL-path-secret layer (MCP_PATH).
+            """
+
+            def _external_base_local(scope):
+                host_hdr = ""
+                proto = None
+                for name, value in scope.get("headers", []):
+                    if name == b"host" and not host_hdr:
+                        host_hdr = value.decode("latin-1")
+                    elif name == b"x-forwarded-host" and not host_hdr:
+                        host_hdr = value.decode("latin-1").split(",")[0].strip()
+                    elif name == b"x-forwarded-proto":
+                        proto = value.decode("latin-1").split(",")[0].strip()
+                if not proto:
+                    proto = scope.get("scheme", "http")
+                return f"{proto}://{host_hdr}" if host_hdr else ""
+
+            async def wrapped(scope, receive, send):
+                if scope["type"] != "http":
+                    await asgi_app(scope, receive, send)
+                    return
+
+                req_path = scope.get("path", "")
+                is_mcp = req_path == mcp_path or req_path.startswith(
+                    mcp_path + "/"
+                )
+                if not is_mcp:
+                    await asgi_app(scope, receive, send)
+                    return
+
+                has_bearer = False
+                for name, value in scope.get("headers", []):
+                    if name == b"authorization":
+                        if (
+                            value.decode("latin-1").strip().lower().startswith(
+                                "bearer "
+                            )
+                        ):
+                            has_bearer = True
+                        break
+
+                if has_bearer:
+                    await asgi_app(scope, receive, send)
+                    return
+
+                base = _external_base_local(scope)
+                prm_url = (
+                    f"{base}/.well-known/oauth-protected-resource{mcp_path}"
+                )
+                www_auth = f'Bearer resource_metadata="{prm_url}"'
+                body = json.dumps(
+                    {
+                        "error": "invalid_token",
+                        "error_description": "Bearer token required",
+                    }
+                ).encode("utf-8")
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            (b"content-type", b"application/json"),
+                            (b"content-length", str(len(body)).encode()),
+                            (b"www-authenticate", www_auth.encode("utf-8")),
+                            (b"cache-control", b"no-store"),
+                        ],
+                    }
+                )
+                await send({"type": "http.response.body", "body": body})
+
+            return wrapped
+
         async def _serve():
             app = mcp.streamable_http_app()
-            # Stack inside-out: MCP (innermost) → bearer → accept_shim
-            #                 → oauth_stub → debug
+            # Stack inside-out:
+            #   MCP (innermost) → bearer (if set) → mcp_auth_gate
+            #     → accept_shim → oauth_stub → debug (outermost)
+            #
+            # Per MCP auth spec 2025-11-25, every unauthenticated MCP
+            # request must get 401 + WWW-Authenticate: Bearer
+            # resource_metadata=... Claude.ai depends on this 401 to
+            # realize it must complete OAuth before retrying with a
+            # Bearer token — without it, the connector treats the
+            # initial 200 as 'no auth needed' and never uses the token
+            # it subsequently obtains.
             if bearer_token:
                 expected = f"Bearer {bearer_token}".encode("utf-8")
                 app = bearer_auth_middleware(app, expected)
-            # Accept shim must run AFTER bearer auth (so bearer can still
-            # reject unauth) but BEFORE the SDK's strict Accept check.
+            app = mcp_auth_gate_middleware(app, path)
+            # Accept shim must run AFTER auth gates (so 401 is still
+            # issued for non-MCP-compliant Accept values) but BEFORE
+            # the SDK's strict Accept check.
             app = accept_shim_middleware(app)
-            # OAuth stub must run OUTSIDE bearer (discovery should always
-            # be reachable) and OUTSIDE accept_shim (we serve our own JSON
-            # response). Short-circuits /.well-known/oauth-protected-resource
-            # so Claude.ai connector sees 'no auth required' and proceeds.
+            # OAuth stub must run OUTSIDE bearer/auth-gate (discovery
+            # should always be reachable) and OUTSIDE accept_shim
+            # (we serve our own JSON response).
             app = oauth_stub_middleware(app)
             if debug_requests:
                 app = debug_log_middleware(app)
