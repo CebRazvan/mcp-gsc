@@ -27,6 +27,12 @@ WORKDIR /app
 COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
 COPY --chown=10001:10001 gsc_server.py ./
 
+# gsc_server.py does os.makedirs(_CONFIG_DIR) at module load. Default
+# platformdirs.user_config_dir("mcp-gsc") = $HOME/.config/mcp-gsc, and
+# our non-root user has no writable home (useradd --no-create-home).
+# Point GSC_CONFIG_DIR at a dir we own explicitly.
+RUN mkdir -p /app/.config/mcp-gsc && chown -R 10001:10001 /app/.config
+
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -34,6 +40,7 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=3001 \
     MCP_PATH=/mcp \
+    GSC_CONFIG_DIR=/app/.config/mcp-gsc \
     GSC_SKIP_OAUTH=true \
     GSC_DATA_STATE=all \
     GSC_ALLOW_DESTRUCTIVE=false
