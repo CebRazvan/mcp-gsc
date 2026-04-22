@@ -1657,7 +1657,18 @@ async def reauthenticate() -> str:
 
 
 def main():
-    """Entry point for the MCP server. Supports stdio (default) and SSE transports."""
+    """Entry point for the MCP server.
+
+    Supports three transports selected via MCP_TRANSPORT:
+      - stdio (default)          — for local MCP hosts (Claude Desktop, Cursor, etc.)
+      - sse                      — legacy Server-Sent Events HTTP transport
+      - streamable-http          — modern streamable HTTP transport for remote MCP
+                                   (Claude.ai connectors, reverse-proxy deployments)
+
+    For streamable-http the server runs stateless with JSON responses — optimal for
+    horizontal scaling and reverse-proxy (Traefik, nginx) setups. Path defaults to
+    /mcp and can be overridden via MCP_PATH.
+    """
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     try:
@@ -1667,12 +1678,23 @@ def main():
 
     if transport == "stdio":
         mcp.run(transport="stdio")
-    elif transport in {"sse", "http"}:
+    elif transport in {"sse"}:
         mcp.run(transport="sse", host=host, port=port)
+    elif transport in {"streamable-http", "http"}:
+        # Configure FastMCP's settings in place; the module-level FastMCP()
+        # constructor already ran, so we mutate the settings object rather
+        # than passing kwargs to run().
+        path = os.environ.get("MCP_PATH", "/mcp")
+        mcp.settings.host = host
+        mcp.settings.port = port
+        mcp.settings.stateless_http = True
+        mcp.settings.json_response = True
+        mcp.settings.streamable_http_path = path
+        mcp.run(transport="streamable-http")
     else:
         raise ValueError(
             f"Unknown MCP_TRANSPORT '{transport}'. "
-            "Use 'stdio' (default) or 'sse'."
+            "Use 'stdio' (default), 'sse', or 'streamable-http'."
         )
 
 

@@ -1,0 +1,28 @@
+services:
+  mcp-gsc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      MCP_TRANSPORT: streamable-http
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 3001
+      MCP_PATH: /mcp
+      GSC_SKIP_OAUTH: "true"
+      GSC_CREDENTIALS_PATH: /run/secrets/gsc_sa.json
+      GSC_DATA_STATE: all
+      GSC_ALLOW_DESTRUCTIVE: "false"
+    volumes:
+      # SA JSON must be chown'd to 10001:10001 on the host before the first
+      # start, otherwise the non-root container hits EACCES. See DEPLOY.md.
+      - /var/lib/dokploy/mcp-gsc-secrets:/run/secrets:ro
+    expose:
+      - "3001"
+    labels:
+      # Declare the rate-limit middleware. Traefik picks this up from any
+      # container's labels and registers it globally — the middleware still
+      # needs to be attached to the router (see DEPLOY.md §6 Путь A or B).
+      - "traefik.http.middlewares.gsc-rl.ratelimit.average=5"
+      - "traefik.http.middlewares.gsc-rl.ratelimit.burst=10"
+      - "traefik.http.middlewares.gsc-rl.ratelimit.period=1s"

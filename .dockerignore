@@ -2,6 +2,27 @@
 token.json
 client_secrets.json
 service_account_credentials.json
+service_account*.json
+gsc_sa*.json
+credentials/
+secrets/
+
+# TLS / keys — defensive
+*.pem
+*.key
+*.crt
+*.p12
+
+# Env files (but keep the example)
+.env
+.env.*
+!.env.example
+
+# Deployment artifacts — not needed in the image
+PLAN.md
+DEPLOY.md
+test_endpoint.sh
+docker-compose.yml
 
 # Internal planning files
 FORK_ANALYSIS.md

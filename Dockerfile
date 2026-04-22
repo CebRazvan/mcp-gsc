@@ -1,12 +1,52 @@
-FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim
+# syntax=docker/dockerfile:1.7
+
+# ---------- builder ----------
+FROM ghcr.io/astral-sh/uv:python3.13-bookworm-slim AS builder
 WORKDIR /app
 
-# Copy dependency files first for layer caching — deps only reinstall when these change
-COPY pyproject.toml README.md ./
-RUN uv sync --no-cache --no-install-project
+ENV UV_LINK_MODE=copy \
+    UV_COMPILE_BYTECODE=1 \
+    UV_PYTHON_DOWNLOADS=never
 
-# Copy application code
-COPY gsc_server.py .
+COPY pyproject.toml uv.lock README.md ./
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-install-project --no-dev
 
-# Default to stdio transport; override with MCP_TRANSPORT=sse for remote/network use
-CMD ["uv", "run", "--no-sync", "python", "gsc_server.py"]
+# ---------- runtime ----------
+FROM python:3.13-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid 10001 --no-create-home --shell /sbin/nologin app
+
+WORKDIR /app
+
+COPY --from=builder --chown=10001:10001 /app/.venv /app/.venv
+COPY --chown=10001:10001 gsc_server.py ./
+
+ENV PATH="/app/.venv/bin:${PATH}" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    MCP_TRANSPORT=streamable-http \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=3001 \
+    MCP_PATH=/mcp \
+    GSC_SKIP_OAUTH=true \
+    GSC_DATA_STATE=all \
+    GSC_ALLOW_DESTRUCTIVE=false
+
+EXPOSE 3001
+
+USER 10001:10001
+
+# Tolerant healthcheck: MCP streamable-http returns 400/405/406 for naive GET
+# without the right Accept headers. Any of those codes means "process is alive
+# and answering", which is what we want. 5xx / timeout = really broken.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -fsS -o /dev/null -w "%{http_code}" http://localhost:3001/mcp \
+        | grep -qE "^(200|400|405|406)$" || exit 1
+
+CMD ["python", "gsc_server.py"]

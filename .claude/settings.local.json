@@ -1,0 +1,11 @@
+{
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "mcp-search-console"
+  ],
+  "permissions": {
+    "allow": [
+      "Bash(uv run python -c ' *)"
+    ]
+  }
+}
