@@ -1690,7 +1690,14 @@ def main():
         mcp.settings.host = host
         mcp.settings.port = port
         mcp.settings.stateless_http = True
-        mcp.settings.json_response = True
+        # SSE response mode (default). When json_response=True the SDK accepts
+        # clients that send only Accept: application/json in headers, but it
+        # REJECTS clients that send only Accept: text/event-stream (Claude.ai's
+        # MCP connector does the latter in some code paths — observed in prod
+        # as 406 Not Acceptable). With json_response=False the SDK requires
+        # both types in Accept, which is what the MCP spec mandates — and
+        # what spec-compliant clients (including Claude.ai) send.
+        mcp.settings.json_response = os.environ.get("MCP_JSON_RESPONSE", "false").lower() in ("true", "1", "yes")
         mcp.settings.streamable_http_path = path
 
         # DNS rebinding protection: the module-level FastMCP() default sets
@@ -1719,14 +1726,22 @@ def main():
                 enable_dns_rebinding_protection=False,
             )
 
-        # Optional Bearer-token auth. If MCP_BEARER_TOKEN is set, we wrap the
-        # Starlette app with a minimal ASGI middleware that rejects anything
-        # without a matching Authorization header (HTTP 401). If unset, the
-        # server is unauthenticated — fine for local/dev but dangerous for a
-        # public endpoint. Comparison is timing-safe via hmac.compare_digest.
+        # Optional middlewares (stacked outside-in):
+        #   - Debug request logger (MCP_DEBUG_REQUESTS=true): logs method,
+        #     path, Accept, Content-Type — useful for diagnosing 406/404 in
+        #     production without attaching a debugger.
+        #   - Bearer-token auth (MCP_BEARER_TOKEN): rejects unauthenticated
+        #     requests with 401 before they reach the MCP SDK. Timing-safe
+        #     comparison via hmac.compare_digest.
         bearer_token = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+        debug_requests = os.environ.get("MCP_DEBUG_REQUESTS", "").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
 
-        if not bearer_token:
+        if not bearer_token and not debug_requests:
+            # Nothing to wrap — let FastMCP.run() do its thing directly.
             mcp.run(transport="streamable-http")
         else:
             import anyio
@@ -1734,9 +1749,30 @@ def main():
             import uvicorn
             from starlette.responses import PlainTextResponse
 
-            expected_auth = f"Bearer {bearer_token}".encode("utf-8")
+            def debug_log_middleware(asgi_app):
+                async def wrapped(scope, receive, send):
+                    if scope["type"] == "http":
+                        headers = {
+                            name.decode("latin-1"): value.decode("latin-1")
+                            for name, value in scope.get("headers", [])
+                        }
+                        method = scope.get("method", "?")
+                        req_path = scope.get("path", "?")
+                        accept = headers.get("accept", "<absent>")
+                        ctype = headers.get("content-type", "<absent>")
+                        has_auth = "authorization" in headers
+                        print(
+                            f"[mcp-debug] {method} {req_path} "
+                            f"Accept={accept!r} Content-Type={ctype!r} "
+                            f"has-auth={has_auth}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    await asgi_app(scope, receive, send)
 
-            def bearer_auth_middleware(asgi_app):
+                return wrapped
+
+            def bearer_auth_middleware(asgi_app, expected_auth_bytes):
                 async def wrapped(scope, receive, send):
                     if scope["type"] != "http":
                         await asgi_app(scope, receive, send)
@@ -1748,7 +1784,7 @@ def main():
                             auth_header = value
                             break
 
-                    if not _hmac.compare_digest(auth_header, expected_auth):
+                    if not _hmac.compare_digest(auth_header, expected_auth_bytes):
                         response = PlainTextResponse(
                             "Unauthorized",
                             status_code=401,
@@ -1762,10 +1798,18 @@ def main():
                 return wrapped
 
             async def _serve():
-                starlette_app = mcp.streamable_http_app()
-                wrapped_app = bearer_auth_middleware(starlette_app)
+                app = mcp.streamable_http_app()
+                # Stack inside-out: innermost = MCP, then optional bearer,
+                # then optional debug (outermost so it sees original request
+                # before any rejection).
+                if bearer_token:
+                    expected = f"Bearer {bearer_token}".encode("utf-8")
+                    app = bearer_auth_middleware(app, expected)
+                if debug_requests:
+                    app = debug_log_middleware(app)
+
                 config = uvicorn.Config(
-                    wrapped_app,
+                    app,
                     host=host,
                     port=port,
                     log_level=mcp.settings.log_level.lower(),
@@ -1773,11 +1817,18 @@ def main():
                 server = uvicorn.Server(config)
                 await server.serve()
 
-            print(
-                f"[gsc-server] Bearer token auth ENABLED "
-                f"(token length: {len(bearer_token)})",
-                file=sys.stderr,
-            )
+            if bearer_token:
+                print(
+                    f"[gsc-server] Bearer token auth ENABLED "
+                    f"(token length: {len(bearer_token)})",
+                    file=sys.stderr,
+                )
+            if debug_requests:
+                print(
+                    "[gsc-server] Debug request logging ENABLED "
+                    "(set MCP_DEBUG_REQUESTS=false to disable)",
+                    file=sys.stderr,
+                )
             anyio.run(_serve)
     else:
         raise ValueError(
