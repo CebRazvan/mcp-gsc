@@ -1773,35 +1773,56 @@ def main():
             bearer check would reject the dummy tokens we issue here.
             """
             import base64 as _b64
-            import hashlib as _hashlib
-            import hmac as _hmac_jwt
             import secrets as _secrets
             import time as _time
             from urllib.parse import parse_qs, quote, urlencode
 
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding, rsa
+
             _WELL_KNOWN_PRM = "/.well-known/oauth-protected-resource"
             _WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
+            _JWKS_PATH = "/.well-known/jwks.json"
             _DUMMY_CLIENT_ID = "mcp-gsc-public-client"
             _DUMMY_CODE = "mcp-gsc-dummy-code"
-            # Per-process HMAC secret for signing stub JWTs. It is not
-            # used to authenticate anything — the MCP endpoint ignores
-            # bearer tokens when MCP_BEARER_TOKEN is unset. Exists only
-            # so Claude.ai's token parser accepts a structurally valid
-            # HS256 JWT (Claude parses the access_token as JWT to extract
-            # exp/aud/scope before using it).
-            _JWT_SECRET = _secrets.token_bytes(32)
+            _KID = "mcp-gsc-stub-rsa-1"
+
+            # Generate an RSA keypair at process start. Public key is
+            # served at /.well-known/jwks.json so Claude.ai can verify
+            # JWT signatures. Private key never leaves the process. The
+            # signature isn't authenticating anything (MCP endpoint
+            # ignores bearer when MCP_BEARER_TOKEN is unset) — it only
+            # exists so clients that enforce RFC 7517 JWKS verification
+            # (Claude.ai does) accept our tokens.
+            _rsa_private_key = rsa.generate_private_key(
+                public_exponent=65537, key_size=2048
+            )
+            _rsa_public_numbers = _rsa_private_key.public_key().public_numbers()
 
             def _b64url(raw: bytes) -> bytes:
                 return _b64.urlsafe_b64encode(raw).rstrip(b"=")
 
+            def _int_to_b64url(value: int) -> str:
+                b = value.to_bytes((value.bit_length() + 7) // 8 or 1, "big")
+                return _b64url(b).decode("ascii")
+
+            _JWK_PUBLIC = {
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": _KID,
+                "n": _int_to_b64url(_rsa_public_numbers.n),
+                "e": _int_to_b64url(_rsa_public_numbers.e),
+            }
+
             def _make_jwt(payload: dict, typ: str = "at+jwt") -> str:
-                header = {"alg": "HS256", "typ": typ}
+                header = {"alg": "RS256", "typ": typ, "kid": _KID}
                 h = _b64url(json.dumps(header, separators=(",", ":")).encode())
                 p = _b64url(json.dumps(payload, separators=(",", ":")).encode())
                 signing_input = h + b"." + p
-                sig = _hmac_jwt.new(
-                    _JWT_SECRET, signing_input, _hashlib.sha256
-                ).digest()
+                sig = _rsa_private_key.sign(
+                    signing_input, padding.PKCS1v15(), hashes.SHA256()
+                )
                 s = _b64url(sig)
                 return (signing_input + b"." + s).decode("ascii")
 
@@ -1829,6 +1850,7 @@ def main():
                             (b"content-type", b"application/json"),
                             (b"content-length", str(len(body)).encode()),
                             (b"cache-control", b"no-store"),
+                            (b"pragma", b"no-cache"),
                         ],
                     }
                 )
@@ -1897,13 +1919,23 @@ def main():
                             "authorization_endpoint": f"{base}/authorize",
                             "token_endpoint": f"{base}/token",
                             "registration_endpoint": f"{base}/register",
+                            "jwks_uri": f"{base}{_JWKS_PATH}",
                             "response_types_supported": ["code"],
-                            "grant_types_supported": ["authorization_code"],
-                            "code_challenge_methods_supported": ["S256", "plain"],
+                            "grant_types_supported": [
+                                "authorization_code",
+                                "refresh_token",
+                            ],
+                            "code_challenge_methods_supported": ["S256"],
                             "token_endpoint_auth_methods_supported": ["none"],
                             "scopes_supported": ["mcp"],
+                            "id_token_signing_alg_values_supported": ["RS256"],
                         },
                     )
+                    return
+
+                # --- 2b. JWKS — public key for JWT signature verification ---
+                if method == "GET" and req_path == _JWKS_PATH:
+                    await _json(send, 200, {"keys": [_JWK_PUBLIC]})
                     return
 
                 # --- 3. Dynamic Client Registration (RFC 7591) ---
