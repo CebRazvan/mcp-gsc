@@ -53,8 +53,13 @@ USER 10001:10001
 # without the right Accept headers. 401 appears when MCP_BEARER_TOKEN is set
 # and the healthcheck itself has no token — still means "process is alive".
 # Any of those codes = healthy. 5xx / timeout = really broken.
+#
+# MCP_PATH is expanded at runtime by /bin/sh (HEALTHCHECK uses shell form),
+# so changing MCP_PATH to a secret-prefixed path (e.g. /abc123.../mcp) makes
+# the healthcheck hit the right route automatically. Without this, the check
+# hits stale /mcp → 404 → container marked unhealthy → Traefik stops routing.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -fsS -o /dev/null -w "%{http_code}" http://localhost:3001/mcp \
+    CMD curl -fsS -o /dev/null -w "%{http_code}" "http://localhost:3001${MCP_PATH:-/mcp}" \
         | grep -qE "^(200|400|401|405|406)$" || exit 1
 
 CMD ["python", "gsc_server.py"]
