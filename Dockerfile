@@ -59,7 +59,7 @@ USER 10001:10001
 # the healthcheck hit the right route automatically. Without this, the check
 # hits stale /mcp → 404 → container marked unhealthy → Traefik stops routing.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD curl -sS -o /dev/null -w "%{http_code}" "http://localhost:3001${MCP_PATH:-/mcp}" \
+    CMD curl -sS --max-time 3 -o /dev/null -w "%{http_code}" "http://localhost:3001${MCP_PATH:-/mcp}" \
         | grep -qE "^(200|400|401|405|406)$" || exit 1
 
 CMD ["python", "gsc_server.py"]
